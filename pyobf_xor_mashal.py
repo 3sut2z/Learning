@@ -1,40 +1,116 @@
-"""
-pyobf.py - simple python obfuscator
-
-Usage:
-    python pyobf.py input.py output.py --mode simple
-    python pyobf.py input.py output_obf.py --mode ast_rename
-
-Modes:
- - simple: compress+base64 the whole source and produce wrapper that decodes & executes
- - ast_rename: AST-based renaming of local names + string literal encoding (base64+zlib).
-"""
-
-import sys
-import ast
 import argparse
+import os
 import base64
-import zlib
+import marshal
 import random
-import string
-from typing import Dict, Set
+import secrets
+import textwrap
 
-# ---------- Utilities ----------
-def rand_ident(n=8):
-    return '_' + ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(n))
+# -------- Helpers --------
+def xor_bytes(data: bytes, key: bytes) -> bytes:
+    # repeat key
+    out = bytearray(len(data))
+    klen = len(key)
+    for i, b in enumerate(data):
+        out[i] = b ^ key[i % klen]
+    return bytes(out)
 
-def compress_b64(s: bytes) -> str:
-    return base64.b64encode(zlib.compress(s)).decode('ascii')
+def make_random_ident(n=10):
+    import string
+    return '_' + ''.join(random.choice(string.ascii_lowercase) for _ in range(n))
 
-def decompress_b64_expr(b64var_name):
-    # expression to decode and decompress a base64 string at runtime
-    return f"__import__('zlib').decompress(__import__('base64').b64decode({b64var_name}))"
+# -------- Mode: marshal_xor --------
+def build_marshal_xor_wrapper(source: str, key_len=16):
+    # compile to code object then marshal
+    code_obj = compile(source, '<obf>', 'exec')
+    marshalled = marshal.dumps(code_obj)  # bytes
+    key = secrets.token_bytes(key_len)
+    xored = xor_bytes(marshalled, key)
+    b64_payload = base64.b64encode(xored).decode('ascii')
+    b64_key = base64.b64encode(key).decode('ascii')
 
-# ---------- Simple mode ----------
-def make_simple_wrapper(source: str) -> str:
-    compressed = compress_b64(source.encode('utf-8'))
-    wrapper = f"""# Obfuscated by pyobf (simple mode)
-import base64, zlib, types, sys
+    loader_name = make_random_ident(8)
+    wrapper = f"""# Obfuscated by pyobf_xor_marshal (marshal_xor mode)
+import base64, marshal
+def {loader_name}():
+    _k = base64.b64decode({repr(b64_key)})
+    _p = base64.b64decode({repr(b64_payload)})
+    # xor back
+    _d = bytearray(len(_p))
+    for i, b in enumerate(_p):
+        _d[i] = b ^ _k[i % len(_k)]
+    _code = marshal.loads(bytes(_d))
+    exec(_code, {{}})
+{loader_name}()
+"""
+    return wrapper
+
+# -------- Mode: chunk_shuffle --------
+def build_chunk_shuffle_wrapper(source: str, chunks=30):
+    # split into chunks of roughly equal size
+    b = source.encode('utf-8')
+    L = len(b)
+    if chunks < 2:
+        chunks = 2
+    avg = max(1, L // chunks)
+    parts = []
+    i = 0
+    while i < L:
+        size = random.randint(max(1, avg//2), max(1, avg*2))
+        part = b[i:i+size]
+        parts.append(part)
+        i += size
+    # encode each part to base64 and assign random ids
+    encoded = [base64.b64encode(p).decode('ascii') for p in parts]
+    ids = list(range(len(encoded)))
+    shuffled = ids[:]
+    random.shuffle(shuffled)
+
+    # build loader that reconstructs in correct order using mapping
+    loader_name = make_random_ident(8)
+    pieces_list_repr = "[\n" + ",\n".join(f"    {repr(s)}" for s in encoded) + "\n]"
+    order_repr = repr(shuffled)
+    wrapper = f"""# Obfuscated by pyobf_xor_marshal (chunk_shuffle mode)
+import base64
+def {loader_name}():
+    _pieces = {pieces_list_repr}
+    _order = {order_repr}   # shuffled indexes
+    # rebuild original by placing each piece into correct slot
+    _tmp = [None] * len(_pieces)
+    for i, idx in enumerate(_order):
+        _tmp[idx] = _pieces[i]
+    # join and decode
+    _b = b''.join(base64.b64decode(x) for x in _tmp)
+    exec(compile(_b.decode('utf-8'), '<obf_chunk>', 'exec'), {{}})
+{loader_name}()
+"""
+    return wrapper
+
+# ---------- CLI ----------
+def main():
+    p = argparse.ArgumentParser(description="pyobf_xor_marshal - alternative python obfuscator")
+    p.add_argument("input", help="input python file")
+    p.add_argument("output", help="output obfuscated file")
+    p.add_argument("--mode", choices=("marshal_xor","chunk_shuffle"), default="marshal_xor")
+    p.add_argument("--keylen", type=int, default=16, help="key length for marshal_xor")
+    p.add_argument("--chunks", type=int, default=30, help="approx number of chunks for chunk_shuffle")
+    args = p.parse_args()
+
+    with open(args.input, 'r', encoding='utf-8') as f:
+        src = f.read()
+
+    if args.mode == 'marshal_xor':
+        out = build_marshal_xor_wrapper(src, key_len=args.keylen)
+    else:
+        out = build_chunk_shuffle_wrapper(src, chunks=args.chunks)
+
+    with open(args.output, 'w', encoding='utf-8') as f:
+        f.write(out)
+
+    print(f"Obfuscated ({args.mode}) -> {args.output}")
+
+if __name__ == '__main__':
+    main()import base64, zlib, types, sys
 _payload = {repr(compressed)}
 _data = zlib.decompress(base64.b64decode(_payload))
 # execute the code in a fresh globals dict to avoid leaking into wrapper scope
